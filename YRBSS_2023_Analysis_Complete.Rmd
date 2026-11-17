@@ -1,0 +1,334 @@
+## 1. Load data
+
+```{r setup}
+# Install packages once if needed:
+# install.packages(c("tidyverse", "broom"))
+
+library(tidyverse)
+library(broom)
+
+data_path <- path.expand("~/Downloads/YRBSS_2023_official_cleaned.csv")
+if (!file.exists(data_path)) {
+  stop("File not found. Update data_path to the location of YRBSS_2023_official_cleaned.csv")
+}
+raw <- read.csv(data_path)
+
+required <- c("q1", "q2", "q3", "q26", "q27", "q28", "q29", "q76", "q77")
+stopifnot(all(required %in% names(raw)))
+
+cat("Total survey respondents:", nrow(raw), "\n")
+dir.create("figures", showWarnings = FALSE)
+```
+
+## 2. Recode variables
+
+```{r recode}
+# CDC codes: Q26-Q28 (1 = Yes, 2 = No); Q29 (1 = 0 attempts, 2-5 = 1+ attempts).
+# Q76 codes 1-8 represent 0-7 active days; Q77 codes 1-6 represent 0-5 PE days.
+
+df <- raw %>%
+  mutate(
+    sad_hopeless = case_when(q26 == 1 ~ 1, q26 == 2 ~ 0, TRUE ~ NA_real_),
+    suicide_considered = case_when(q27 == 1 ~ 1, q27 == 2 ~ 0, TRUE ~ NA_real_),
+    suicide_planned = case_when(q28 == 1 ~ 1, q28 == 2 ~ 0, TRUE ~ NA_real_),
+    suicide_attempted = case_when(q29 == 1 ~ 0, q29 %in% 2:5 ~ 1, TRUE ~ NA_real_),
+    phys_act_days = if_else(q76 %in% 1:8, q76 - 1, NA_real_),
+    pe_days = if_else(q77 %in% 1:6, q77 - 1, NA_real_),
+    activity_group = case_when(
+      phys_act_days >= 2 ~ "Active",
+      phys_act_days <= 1 ~ "Inactive",
+      TRUE ~ NA_character_
+    ),
+    activity_group = factor(activity_group, levels = c("Inactive", "Active"))
+  )
+
+outcomes <- c("sad_hopeless", "suicide_considered", "suicide_planned", "suicide_attempted")
+outcome_names <- c("Sadness/Hopelessness", "Suicidal Ideation", "Suicide Planning", "Suicide Attempts")
+
+# Confirm that all eight physical activity levels are present.
+table(df$phys_act_days, useNA = "ifany")
+table(df$pe_days, useNA = "ifany")
+```
+
+## 3. Sample characteristics and missing data
+
+```{r descriptive}
+sex_table <- df %>%
+  filter(q2 %in% 1:2) %>%
+  count(q2, name = "n") %>%
+  mutate(sex = if_else(q2 == 1, "Female", "Male"),
+         percent = round(100 * n / sum(n), 1)) %>%
+  select(sex, n, percent)
+
+age_table <- df %>%
+  filter(q1 %in% 1:7) %>%
+  count(q1, name = "n") %>%
+  mutate(age = factor(q1, levels = 1:7,
+                      labels = c("12 or younger", "13", "14", "15", "16", "17", "18 or older")),
+         percent = round(100 * n / sum(n), 1)) %>%
+  select(age, n, percent)
+
+# Each outcome is analyzed with its own available cases.
+sample_sizes <- tibble(
+  outcome = outcome_names,
+  n = map_int(outcomes, ~sum(complete.cases(df[, c("phys_act_days", .x)]))),
+  missing_outcome = map_int(outcomes, ~sum(is.na(df[[.x]])))
+)
+
+print(as.data.frame(sex_table))
+print(as.data.frame(age_table))
+print(as.data.frame(sample_sizes))
+```
+
+## 4. Spearman correlations
+
+```{r correlations}
+cor_results <- map_dfr(outcomes, function(y) {
+  x <- df %>% filter(!is.na(phys_act_days), !is.na(.data[[y]]))
+  test <- cor.test(x$phys_act_days, x[[y]], method = "spearman", exact = FALSE)
+  tibble(outcome = y, n = nrow(x), rho = unname(test$estimate), p_value = test$p.value)
+}) %>%
+  mutate(outcome_label = factor(outcome, levels = outcomes, labels = outcome_names))
+
+print(as.data.frame(cor_results %>% select(outcome_label, n, rho, p_value)))
+```
+
+## 5. Active versus inactive: Welch's t-tests
+
+```{r t-tests}
+t_results <- map_dfr(outcomes, function(y) {
+  x <- df %>% filter(!is.na(activity_group), !is.na(.data[[y]]))
+  test <- t.test(reformulate("activity_group", response = y), data = x)
+  tibble(
+    outcome = y,
+    n = nrow(x),
+    active_rate = mean(x[[y]][x$activity_group == "Active"]),
+    inactive_rate = mean(x[[y]][x$activity_group == "Inactive"]),
+    t_statistic = unname(test$statistic),
+    p_value = test$p.value
+  )
+}) %>%
+  mutate(
+    outcome_label = factor(outcome, levels = outcomes, labels = outcome_names),
+    significance = case_when(
+      p_value < .001 ~ "***", p_value < .01 ~ "**",
+      p_value < .05 ~ "*", TRUE ~ "ns"
+    )
+  )
+
+print(as.data.frame(t_results %>% select(outcome_label, n, active_rate, inactive_rate, t_statistic, p_value)))
+```
+
+## 6. Logistic regression
+
+```{r logistic-regression}
+# A separate unadjusted binomial model is fitted for each outcome.
+fit_models <- function(predictor) {
+  set_names(map(outcomes, ~glm(reformulate(predictor, response = .x),
+                               data = df, family = binomial())), outcomes)
+}
+
+models_days <- fit_models("phys_act_days")
+models_pe <- fit_models("pe_days")
+models_group <- fit_models("activity_group")  # Active versus Inactive reference
+
+# Odds ratios and Wald 95% confidence intervals.
+get_odds_ratios <- function(models, predictor_name) {
+  imap_dfr(models, function(model, y) {
+    tidy(model) %>%
+      filter(term != "(Intercept)") %>%
+      transmute(
+        outcome = y,
+        predictor = predictor_name,
+        n = nobs(model),
+        OR = exp(estimate),
+        lower = exp(estimate - 1.96 * std.error),
+        upper = exp(estimate + 1.96 * std.error),
+        p_value = p.value
+      )
+  })
+}
+
+or_days <- get_odds_ratios(models_days, "Additional physical activity day")
+or_pe <- get_odds_ratios(models_pe, "Additional PE day")
+or_group <- get_odds_ratios(models_group, "Active versus Inactive")
+or_results <- bind_rows(or_days, or_pe, or_group) %>%
+  mutate(outcome_label = factor(outcome, levels = outcomes, labels = outcome_names))
+
+print(as.data.frame(or_results %>% select(predictor, outcome_label, n, OR, lower, upper, p_value)))
+```
+
+## 7. Figure 1: Active versus inactive prevalence
+
+```{r figure-1}
+plot_long <- df %>%
+  select(phys_act_days, activity_group, all_of(outcomes)) %>%
+  pivot_longer(cols = all_of(outcomes), names_to = "outcome", values_to = "response") %>%
+  mutate(outcome_label = factor(outcome, levels = outcomes, labels = outcome_names))
+
+group_prevalence <- plot_long %>%
+  filter(!is.na(activity_group), !is.na(response)) %>%
+  group_by(outcome_label, activity_group) %>%
+  summarise(n = n(), prevalence = mean(response), .groups = "drop") %>%
+  mutate(
+    se = sqrt(prevalence * (1 - prevalence) / n),
+    lower = pmax(0, prevalence - 1.96 * se),
+    upper = pmin(1, prevalence + 1.96 * se)
+  )
+
+star_labels <- group_prevalence %>%
+  group_by(outcome_label) %>%
+  summarise(y_pos = max(upper) * 1.14, .groups = "drop") %>%
+  left_join(t_results %>% select(outcome_label, significance), by = "outcome_label")
+
+fig1 <- ggplot(group_prevalence,
+               aes(x = activity_group, y = prevalence, fill = activity_group)) +
+  geom_col(width = .68) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = .18) +
+  geom_text(data = star_labels,
+            aes(x = 1.5, y = y_pos, label = significance),
+            inherit.aes = FALSE, size = 5) +
+  facet_wrap(~outcome_label, scales = "free_y") +
+  scale_x_discrete(limits = c("Active", "Inactive"),
+                   labels = c("Active (>=2 days)", "Inactive (<=1 day)")) +
+  scale_fill_manual(values = c("Active" = "#EE6561", "Inactive" = "#18AFB4")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, .20))) +
+  labs(x = NULL, y = "Prevalence (%)") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none", strip.text = element_text(face = "bold"),
+        axis.text.x = element_text(size = 9))
+
+print(fig1)
+ggsave("figures/Figure1_Activity_Groups.png", fig1, width = 10, height = 7, dpi = 600, bg = "white")
+ggsave("figures/Figure1_Activity_Groups.pdf", fig1, width = 10, height = 7, bg = "white")
+```
+
+## 8. Figure 2: Odds ratios per additional active day
+
+```{r figure-2}
+fig2 <- ggplot(or_results %>% filter(predictor == "Additional physical activity day"),
+               aes(x = outcome_label, y = OR)) +
+  geom_pointrange(aes(ymin = lower, ymax = upper), color = "#245A81") +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  coord_flip() +
+  labs(x = NULL, y = "Odds ratio per additional physically active day") +
+  theme_classic(base_size = 12)
+
+print(fig2)
+ggsave("figures/Figure2_Physical_Activity_OR.png", fig2, width = 9, height = 5.5, dpi = 600, bg = "white")
+ggsave("figures/Figure2_Physical_Activity_OR.pdf", fig2, width = 9, height = 5.5, bg = "white")
+```
+
+## 9. Figure 3: Prevalence across all 0-7 active days
+
+```{r figure-3}
+day_prevalence <- plot_long %>%
+  filter(!is.na(phys_act_days), !is.na(response)) %>%
+  group_by(outcome_label, phys_act_days) %>%
+  summarise(n = n(), prevalence = mean(response), .groups = "drop") %>%
+  mutate(
+    se = sqrt(prevalence * (1 - prevalence) / n),
+    lower = pmax(0, prevalence - 1.96 * se),
+    upper = pmin(1, prevalence + 1.96 * se)
+  )
+
+cor_labels <- cor_results %>%
+  mutate(label = sprintf("Spearman rho = %.3f", rho))
+
+fig3 <- ggplot(day_prevalence, aes(x = phys_act_days, y = prevalence)) +
+  geom_line(color = "grey45", linewidth = .7) +
+  geom_point(color = "#245A81", size = 2.5) +
+  geom_errorbar(aes(ymin = lower, ymax = upper),
+                color = "#245A81", width = .12) +
+  geom_text(data = cor_labels,
+            aes(x = 0, y = Inf, label = label),
+            inherit.aes = FALSE, hjust = 0, vjust = 1.5, size = 3.5) +
+  facet_wrap(~outcome_label, ncol = 2, scales = "free_y") +
+  scale_x_continuous(breaks = 0:7, limits = c(0, 7)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(.08, .20))) +
+  labs(x = "Physically active days per week", y = "Prevalence (%)") +
+  theme_classic(base_size = 12) +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        panel.spacing = grid::unit(1.5, "lines"))
+
+print(fig3)
+ggsave("figures/Figure3_Daily_Prevalence.png", fig3, width = 10, height = 7, dpi = 600, bg = "white")
+ggsave("figures/Figure3_Daily_Prevalence.pdf", fig3, width = 10, height = 7, bg = "white")
+```
+
+## 10. Optional Figure 4: Logistic predicted probabilities
+
+```{r figure-4}
+# Unlike the observed prevalence in Figure 3, these curves use fitted logistic models.
+predicted <- imap_dfr(models_days, function(model, y) {
+  new_data <- data.frame(phys_act_days = 0:7)
+  p <- predict(model, newdata = new_data, type = "link", se.fit = TRUE)
+  tibble(
+    outcome = y,
+    phys_act_days = 0:7,
+    probability = plogis(p$fit),
+    lower = plogis(p$fit - 1.96 * p$se.fit),
+    upper = plogis(p$fit + 1.96 * p$se.fit)
+  )
+}) %>%
+  mutate(outcome_label = factor(outcome, levels = outcomes, labels = outcome_names))
+
+fig4 <- ggplot(predicted, aes(x = phys_act_days, y = probability)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "#245A81", alpha = .15) +
+  geom_line(color = "#245A81", linewidth = .9) +
+  facet_wrap(~outcome_label, ncol = 2, scales = "free_y") +
+  scale_x_continuous(breaks = 0:7) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Physically active days per week", y = "Predicted probability") +
+  theme_classic(base_size = 12) +
+  theme(strip.background = element_blank(), strip.text = element_text(face = "bold"))
+
+print(fig4)
+ggsave("figures/Figure4_Predicted_Probabilities.png", fig4, width = 10, height = 7, dpi = 600, bg = "white")
+ggsave("figures/Figure4_Predicted_Probabilities.pdf", fig4, width = 10, height = 7, bg = "white")
+```
+
+
+## 11. Figure 5: Odds ratios per additional PE day
+
+```{r figure-5}
+fig5 <- ggplot(or_results %>% filter(predictor == "Additional PE day"),
+               aes(x = outcome_label, y = OR)) +
+  geom_pointrange(aes(ymin = lower, ymax = upper), color = "#245A81") +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  coord_flip() +
+  labs(x = NULL, y = "Odds ratio per additional PE day") +
+  theme_classic(base_size = 12)
+
+print(fig5)
+ggsave("figures/Figure5_PE_OR.png", fig5, width = 9, height = 5.5, dpi = 600, bg = "white")
+ggsave("figures/Figure5_PE_OR.pdf", fig5, width = 9, height = 5.5, bg = "white")
+```
+
+## 12. Figure 6: Odds ratios for active versus inactive students
+
+```{r figure-6}
+fig6 <- ggplot(or_results %>% filter(predictor == "Active versus Inactive"),
+               aes(x = outcome_label, y = OR)) +
+  geom_pointrange(aes(ymin = lower, ymax = upper), color = "#245A81") +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  coord_flip() +
+  labs(x = NULL, y = "Odds ratio: Active versus Inactive") +
+  theme_classic(base_size = 12)
+
+print(fig6)
+ggsave("figures/Figure6_Activity_Group_OR.png", fig6, width = 9, height = 5.5, dpi = 600, bg = "white")
+ggsave("figures/Figure6_Activity_Group_OR.pdf", fig6, width = 9, height = 5.5, bg = "white")
+```
+
+## 13. Export results as CSV
+
+```{r export-tables}
+write.csv(cor_results, "figures/Correlations.csv", row.names = FALSE)
+write.csv(t_results, "figures/Activity_Group_TTests.csv", row.names = FALSE)
+write.csv(or_results, "figures/Logistic_Odds_Ratios.csv", row.names = FALSE)
+write.csv(sample_sizes, "figures/Model_Sample_Sizes.csv", row.names = FALSE)
+```
